@@ -1,0 +1,83 @@
+name: Verify fix
+on: push
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      BASE: 5ebb1923dabc630ab76b743561a84a1807b600e9
+      FILES: api/services/knowledge/dataset_service.py api/tests/e2e_tests/containers/services/test_dataset_service_batch_update_document_status.py
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+      - run: uv sync --project api --dev
+      - name: Ruff on the changed files
+        run: |
+          uv run --project api --dev ruff check $FILES
+          uv run --project api --dev ruff format --check $FILES
+      - name: Import linter and guards (as in style.yml)
+        run: |
+          uv run --directory api --dev lint-imports
+          uv run --project api python scripts/check_no_new_getattr.py --base-rev "$BASE"
+          uv run --project api python scripts/check_no_new_session_mock.py --base-rev "$BASE"
+          uv run --project api python scripts/check_no_spec_mock.py
+          uv run --project api python scripts/check_no_new_cast.py --base-rev "$BASE"
+          uv run --project api python scripts/check_no_new_test_doubles.py --base-rev "$BASE"
+      - name: Type checks (make type-check-core, as in style.yml)
+        run: make type-check-core
+      - name: Unit tests of the dataset service (with the fix)
+        run: |
+          uv run --project api pytest -p no:benchmark -o 'addopts=-p no:langsmith_plugin --import-mode=importlib' -n 4 \
+            api/tests/unit_tests/services/knowledge api/tests/unit_tests/controllers/service_api/dataset
+      - name: Container tests of the batch status update (with the fix)
+        run: |
+          uv run --project api pytest -p no:benchmark -o 'addopts=-p no:langsmith_plugin --import-mode=importlib' -n 2 -v \
+            api/tests/e2e_tests/containers/services/test_dataset_service_batch_update_document_status.py \
+            api/tests/e2e_tests/containers/services/document_service_status.py
+      - name: Statement counts, with the fix and before it
+        run: |
+          cat > "$RUNNER_TEMP/count.py" <<'PY'
+          # Counts the statements of batch_update_document_status for 3, 12 and 100 documents.
+          from tests.e2e_tests.containers.services.test_dataset_service_batch_update_document_status import *  # noqa
+          from sqlalchemy import event
+
+
+          class TestCounts(TestDatasetServiceBatchUpdateDocumentStatus):
+              def test_print(self, db_session_with_containers, patched_dependencies):
+                  dataset = DocumentBatchUpdateIntegrationDataFactory.create_dataset(db_session_with_containers)
+                  user = DocumentBatchUpdateIntegrationDataFactory.create_user()
+                  out = {}
+                  for n in (3, 12, 100):
+                      ids = [str(uuid4()) for _ in range(n)]
+                      DocumentBatchUpdateIntegrationDataFactory.create_multiple_documents(
+                          db_session_with_containers, dataset=dataset, document_ids=ids, enabled=False
+                      )
+                      st = []
+                      engine = db_session_with_containers.get_bind()
+                      rec = lambda *a: st.append(a[2])
+                      event.listen(engine, "before_cursor_execute", rec)
+                      try:
+                          DocumentService.batch_update_document_status(
+                              dataset=dataset, document_ids=ids, action="enable", user=user, session=db_session_with_containers
+                          )
+                      finally:
+                          event.remove(engine, "before_cursor_execute", rec)
+                      out[n] = len(st)
+                  print(f"\nVERIFYCOUNTS documents -> statements: {out}")
+          PY
+          cp "$RUNNER_TEMP/count.py" api/tests/e2e_tests/containers/services/test_zz_verify_counts.py
+          run() { uv run --project api pytest -p no:benchmark -o 'addopts=-p no:langsmith_plugin --import-mode=importlib' -s -q \
+            api/tests/e2e_tests/containers/services/test_zz_verify_counts.py -k test_print; }
+          echo "== with the fix"; run
+          git checkout "$BASE" -- api/services/knowledge/dataset_service.py
+          echo "== before the fix"; run
+          if uv run --project api pytest -p no:benchmark -o 'addopts=-p no:langsmith_plugin --import-mode=importlib' -q \
+            api/tests/e2e_tests/containers/services/test_dataset_service_batch_update_document_status.py -k query_count; then
+            echo "::error::the new test passes without the fix"; exit 1
+          fi
+          echo "the new test fails without the fix, as expected"
