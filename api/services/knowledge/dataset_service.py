@@ -3309,9 +3309,24 @@ class DocumentService:
 
         documents_to_update = []
 
+        def id_key(document_id: str) -> str:
+            # The database also matches other spellings of a UUID (upper case, no hyphens).
+            try:
+                return str(uuid.UUID(document_id))
+            except ValueError:
+                return document_id
+
+        # Load the documents in one query; the passes below keep the order of document_ids.
+        documents_by_id = {
+            id_key(document.id): document
+            for document in DocumentService.get_documents_by_ids(
+                DatasetRef(tenant_id=dataset.tenant_id, dataset_id=dataset.id), document_ids, session
+            )
+        }
+
         # First pass: validate all documents and prepare updates
         for document_id in document_ids:
-            document = DocumentService.get_document(dataset.id, document_id, session=session)
+            document = documents_by_id.get(id_key(document_id))
             if not document:
                 continue
 
@@ -3324,6 +3339,8 @@ class DocumentService:
             # Prepare update based on action
             update_info = DocumentService._prepare_document_status_update(document, action, user)
             if update_info:
+                # Kept apart from the document: reading document.id after the commit reloads each row.
+                update_info["document_id"] = document.id
                 documents_to_update.append(update_info)
 
         # Second pass: apply all updates in a single transaction
@@ -3358,18 +3375,17 @@ class DocumentService:
                         task_func.delay(*task_args)
                 except Exception as e:
                     # Log the error but do not rollback the transaction
-                    logger.exception("Error executing async task for document %s", update_info["document"].id)
+                    logger.exception("Error executing async task for document %s", update_info["document_id"])
                     # don't raise the error immediately, but capture it for later
                     propagation_error = e
                 try:
                     # Set Redis cache if needed after successful commit
                     if update_info["set_cache"]:
-                        document = update_info["document"]
-                        indexing_cache_key = f"document_{document.id}_indexing"
+                        indexing_cache_key = f"document_{update_info['document_id']}_indexing"
                         redis_client.setex(indexing_cache_key, 600, 1)
                 except Exception:
                     # Log the error but do not rollback the transaction
-                    logger.exception("Error setting cache for document %s", update_info["document"].id)
+                    logger.exception("Error setting cache for document %s", update_info["document_id"])
             # Raise any propagation error after all updates
             if propagation_error:
                 raise propagation_error

@@ -11,6 +11,7 @@ from unittest.mock import call, patch
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from core.rag.index_processor.constant.index_type import IndexStructureType
@@ -665,6 +666,42 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         expected_task_calls = [call(doc_id) for doc_id in document_ids]
         patched_dependencies["redis_client"].setex.assert_has_calls(expected_setex_calls)
         patched_dependencies["add_task"].delay.assert_has_calls(expected_task_calls)
+
+    def test_batch_update_query_count_does_not_grow_with_documents(
+        self, db_session_with_containers: Session, patched_dependencies
+    ):
+        """Load the documents with one query, not with one query per document."""
+        dataset = DocumentBatchUpdateIntegrationDataFactory.create_dataset(db_session_with_containers)
+        user = DocumentBatchUpdateIntegrationDataFactory.create_user()
+
+        def count_statements(document_count: int) -> int:
+            document_ids = [str(uuid4()) for _ in range(document_count)]
+            DocumentBatchUpdateIntegrationDataFactory.create_multiple_documents(
+                db_session_with_containers,
+                dataset=dataset,
+                document_ids=document_ids,
+                enabled=False,
+            )
+            statements: list[str] = []
+
+            def record(_conn: object, _cursor: object, statement: str, *_: object) -> None:
+                statements.append(statement)
+
+            engine = db_session_with_containers.get_bind()
+            event.listen(engine, "before_cursor_execute", record)
+            try:
+                DocumentService.batch_update_document_status(
+                    dataset=dataset,
+                    document_ids=document_ids,
+                    action="enable",
+                    user=user,
+                    session=db_session_with_containers,
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", record)
+            return len(statements)
+
+        assert count_statements(12) == count_statements(3)
 
     def test_batch_update_mixed_document_states_complex_scenario(
         self, db_session_with_containers: Session, patched_dependencies
